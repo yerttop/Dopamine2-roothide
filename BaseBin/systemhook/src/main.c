@@ -272,6 +272,9 @@ bool should_enable_tweaks(void)
 	return true;
 }
 
+
+#include "envbuf.h"
+
 #define POSIX_SPAWN_PROC_TYPE_DRIVER 0x700
 int posix_spawnattr_getprocesstype_np(const posix_spawnattr_t * __restrict, int * __restrict) __API_AVAILABLE(macos(10.8), ios(6.0));
 
@@ -281,6 +284,10 @@ int posix_spawn_hook_roothide(pid_t *restrict pidp, const char *restrict path, s
 								int (*set_process_debugged)(uint64_t pid, bool fullyDebugged), 
 								double jetsamMultiplier)
 {
+	if(!path) { //Don't crash here due to bad posix_spawn call
+		return posix_spawn_hook_shared(pidp, path, desc, argv, envp, orig, trust_binary, set_process_debugged, jetsamMultiplier);
+	}
+
 	if(!desc || !desc->attrp) {
 		posix_spawnattr_t attr=NULL;
 		posix_spawnattr_init(&attr);
@@ -309,13 +316,20 @@ int posix_spawn_hook_roothide(pid_t *restrict pidp, const char *restrict path, s
 		if (jbclient_patch_exec_add(path, should_resume) != 0) { // jdb fault?
 			//restore flags
 			posix_spawnattr_setflags(attrp, flags);
-			return 99;
+			return 199;
 		}
 	}
 
+	// on some devices dyldhook may fail due to vm_protect(VM_PROT_READ|VM_PROT_WRITE), 2, (os/kern) protection failure in dsc::__DATA_CONST:__const, 
+	// so we need to disable dyld-in-cache here. (or we can use VM_PROT_READ|VM_PROT_WRITE|VM_PROT_COPY)
+	char **envc = envbuf_mutcopy((const char **)envp);
+	envbuf_setenv(&envc, "DYLD_IN_CACHE", "0");
+
 	int pid = 0;
-	int ret = posix_spawn_hook_shared(&pid, path, desc, argv, envp, orig, trust_binary, set_process_debugged, jetsamMultiplier);
+	int ret = posix_spawn_hook_shared(&pid, path, desc, argv, envc, orig, trust_binary, set_process_debugged, jetsamMultiplier);
 	if (pidp) *pidp = pid;
+
+	envbuf_free(envc);
 
 	// maybe caller will use it again? restore flags
 	posix_spawnattr_setflags(attrp, flags);
@@ -329,7 +343,7 @@ int posix_spawn_hook_roothide(pid_t *restrict pidp, const char *restrict path, s
 		if (should_suspend) {
 			if(jbclient_patch_spawn(pid, should_resume) != 0) { // jdb fault? kill
 				kill(pid, SIGKILL);
-				return 98;
+				return 198;
 			}
 		}
 	}
@@ -605,6 +619,11 @@ __attribute__((constructor)) static void initializer(void)
 //////////////////////////////////////////////////////////////////////
   /* after unsandboxing jbroot and applying dyldhooks */
 
+	const char* DYLD_IN_CACHE = getenv("DYLD_IN_CACHE");
+	if(strcmp(DYLD_IN_CACHE, "0") == 0) {
+		unsetenv("DYLD_IN_CACHE");
+	}
+
 	redirect_paths(JB_RootPath);
 
 	dlopen(JBROOT_PATH("/usr/lib/roothideinit.dylib"), RTLD_NOW);
@@ -661,7 +680,7 @@ __attribute__((constructor)) static void initializer(void)
 			}
 		}
 
-		if(string_has_suffix(gExecutablePath, "Dopamine.app/Dopamine")) {
+		if(string_has_suffix(gExecutablePath, "/Dopamine.app/Dopamine")) {
 			loadPathHook();
 		}
 
